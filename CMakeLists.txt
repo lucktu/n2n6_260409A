@@ -2,7 +2,7 @@ project(n2n C)
 cmake_minimum_required(VERSION 3.7)
 
 # N2n information
-set(N2N_VERSION 2.3.4.1)
+set(N2N_VERSION 2.3.4.2)
 set(N2N_OSNAME ${CMAKE_SYSTEM_NAME})
 
 add_definitions(-DN2N_VERSION=\"${N2N_VERSION}\" -DN2N_OSNAME=\"${N2N_OSNAME}\")
@@ -90,6 +90,7 @@ add_executable(edge
         aes.c
         twofish.c
         speck.c
+        pearson.c
         transform_null.c
         transform_tf.c
         transform_aes.c
@@ -110,6 +111,7 @@ add_executable(supernode
         aes.c
         twofish.c
         speck.c
+        pearson.c
         transform_null.c
         transform_tf.c
         transform_aes.c

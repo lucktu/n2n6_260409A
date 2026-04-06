@@ -297,12 +297,11 @@ size_t encode_REGISTER_SUPER( uint8_t * base,
     retval += encode_common( base, idx, common );
     retval += encode_buf( base, idx, reg->cookie, N2N_COOKIE_SIZE );
     retval += encode_mac( base, idx, reg->edgeMac );
+    retval += encode_uint32( base, idx, reg->dev_addr.net_addr );
+    retval += encode_uint8( base, idx, reg->dev_addr.net_bitlen );
+    retval += encode_uint8( base, idx, 0 ); /* num_local_socks = 0 */
     retval += encode_uint16( base, idx, 0 ); /* NULL auth scheme */
     retval += encode_uint16( base, idx, 0 ); /* No auth data */
-    retval += encode_uint8( base, idx, reg->request_ip );
-    retval += encode_uint32( base, idx, reg->requested_ip );
-    retval += encode_buf( base, idx, reg->version, 16 );
-    retval += encode_buf( base, idx, reg->os_name, 16 );
 
     return retval;
 }
@@ -317,23 +316,20 @@ size_t decode_REGISTER_SUPER( n2n_REGISTER_SUPER_t * reg,
     memset( reg, 0, sizeof(n2n_REGISTER_SUPER_t) );
     retval += decode_buf( reg->cookie, N2N_COOKIE_SIZE, base, rem, idx );
     retval += decode_mac( reg->edgeMac, base, rem, idx );
+    retval += decode_uint32( &(reg->dev_addr.net_addr), base, rem, idx );
+    retval += decode_uint8( &(reg->dev_addr.net_bitlen), base, rem, idx );
+    /* skip num_local_socks and any local_socks entries */
+    {
+        uint8_t num_local = 0;
+        uint8_t i;
+        retval += decode_uint8( &num_local, base, rem, idx );
+        for (i = 0; i < num_local && *rem >= 11; i++) {
+            n2n_sock_t tmp;
+            retval += decode_sock( &tmp, base, rem, idx );
+        }
+    }
     retval += decode_uint16( &(reg->auth.scheme), base, rem, idx );
     retval += decode_uint16( &(reg->auth.toksize), base, rem, idx );
-    retval += decode_buf( reg->auth.token, reg->auth.toksize, base, rem, idx );
-    retval += decode_uint8( &(reg->request_ip), base, rem, idx );
-    retval += decode_uint32( &(reg->requested_ip), base, rem, idx );
-
-    if (*rem >= 16) {
-        retval += decode_buf( reg->version, 16, base, rem, idx );
-    } else {
-        strcpy(reg->version, "unknown");
-    }
-
-    if (*rem >= 16) {
-        retval += decode_buf( reg->os_name, 16, base, rem, idx );
-    } else {
-        strcpy(reg->os_name, "unknown");
-    }
 
     return retval;
 }
@@ -392,28 +388,15 @@ size_t encode_REGISTER_SUPER_ACK( uint8_t * base,
     retval += encode_common( base, idx, common );
     retval += encode_buf( base, idx, reg->cookie, N2N_COOKIE_SIZE );
     retval += encode_mac( base, idx, reg->edgeMac );
+    retval += encode_uint32( base, idx, reg->dev_addr.net_addr );
+    retval += encode_uint8( base, idx, reg->dev_addr.net_bitlen );
     retval += encode_uint16( base, idx, reg->lifetime );
     retval += encode_sock( base, idx, &(reg->sock) );
     retval += encode_uint8( base, idx, reg->num_sn );
     if ( reg->num_sn > 0 )
     {
-        /* We only support 0 or 1 at this stage */
         retval += encode_sock( base, idx, &(reg->sn_bak) );
     }
-    retval += encode_buf( base, idx, reg->version, 16 );
-    retval += encode_buf( base, idx, reg->os_name, 16 );
-    retval += encode_uint8( base, idx, reg->sn_ipv4_support );
-    retval += encode_uint8( base, idx, reg->sn_ipv6_support );
-    retval += encode_uint32( base, idx, reg->assigned_ip );
-    retval += encode_uint8( base, idx, reg->peer_count );
-    for (int i = 0; i < reg->peer_count && i < 16; i++) {
-        retval += encode_mac( base, idx, reg->peer_macs[i] );
-        retval += encode_uint32( base, idx, reg->peer_ips[i] );
-        retval += encode_sock( base, idx, &reg->peer_pub_ips[i] );
-        retval += encode_buf( base, idx, reg->peer_versions[i], 8 );
-        retval += encode_buf( base, idx, reg->peer_os_names[i], 16 );
-    }
-
     return retval;
 }
 
@@ -428,6 +411,8 @@ size_t decode_REGISTER_SUPER_ACK( n2n_REGISTER_SUPER_ACK_t * reg,
     memset( reg, 0, sizeof(n2n_REGISTER_SUPER_ACK_t) );
     retval += decode_buf( reg->cookie, N2N_COOKIE_SIZE, base, rem, idx );
     retval += decode_mac( reg->edgeMac, base, rem, idx );
+    retval += decode_uint32( &(reg->dev_addr.net_addr), base, rem, idx );
+    retval += decode_uint8( &(reg->dev_addr.net_bitlen), base, rem, idx );
     retval += decode_uint16( &(reg->lifetime), base, rem, idx );
 
     /* Socket is mandatory in this message type */
@@ -439,19 +424,6 @@ size_t decode_REGISTER_SUPER_ACK( n2n_REGISTER_SUPER_ACK_t * reg,
     {
         /* We only support 0 or 1 at this stage */
         retval += decode_sock( &(reg->sn_bak), base, rem, idx );
-    }
-    retval += decode_buf( reg->version, 16, base, rem, idx );
-    retval += decode_buf( reg->os_name, 16, base, rem, idx );
-    retval += decode_uint8( &(reg->sn_ipv4_support), base, rem, idx );
-    retval += decode_uint8( &(reg->sn_ipv6_support), base, rem, idx );
-    retval += decode_uint32( &(reg->assigned_ip), base, rem, idx );
-    retval += decode_uint8( &(reg->peer_count), base, rem, idx );
-    for (int i = 0; i < reg->peer_count && i < 16; i++) {
-        retval += decode_mac( reg->peer_macs[i], base, rem, idx );
-        retval += decode_uint32( &(reg->peer_ips[i]), base, rem, idx );
-        retval += decode_sock( &(reg->peer_pub_ips[i]), base, rem, idx );
-        retval += decode_buf( reg->peer_versions[i], 8, base, rem, idx );
-        retval += decode_buf( reg->peer_os_names[i], 16, base, rem, idx );
     }
 
     return retval;

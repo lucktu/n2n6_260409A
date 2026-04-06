@@ -79,26 +79,16 @@ static void collect_community_peers(n2n_sn_t * sss,
     int count = 0;
 
     while (scan && count < 16) {
-        /* Only include valid peers with assigned IPs, non-zero MACs, and valid public IPs */
         if (memcmp(scan->community_name, community, N2N_COMMUNITY_SIZE) == 0 &&
             scan->assigned_ip != 0 &&
             memcmp(scan->mac_addr, "\x00\x00\x00\x00\x00\x00", 6) != 0 &&
-            scan->sock.family != 0 && /* Check for valid socket family */
-            scan->sock.port != 0) {   /* Check for valid port */
-
-            memcpy(ack->peer_macs[count], scan->mac_addr, N2N_MAC_SIZE);
-            ack->peer_ips[count] = htonl(scan->assigned_ip);
-            ack->peer_pub_ips[count] = scan->sock;
-            strncpy(ack->peer_versions[count], scan->version, 7);
-            ack->peer_versions[count][7] = '\0';
-            strncpy(ack->peer_os_names[count], scan->os_name, 15);
-            ack->peer_os_names[count][15] = '\0';
+            scan->sock.family != 0 &&
+            scan->sock.port != 0) {
             count++;
         }
         scan = scan->next;
     }
-
-    ack->peer_count = count;
+    /* peer_count field removed; sn.c no longer fills peer list into ACK */
 }
 
 static int update_edge( n2n_sn_t * sss,
@@ -1089,31 +1079,21 @@ static int process_udp( n2n_sn_t * sss,
                     macaddr_str( mac_buf, reg.edgeMac ),
                     sock_to_cstr( sockbuf, &(ack.sock) ) );
 
-        uint8_t use_request_ip = reg.request_ip;
-        uint32_t use_requested_ip = reg.requested_ip;
+        uint32_t use_requested_ip = reg.dev_addr.net_addr;
         if (extra_requested_ip != 0) {
-            use_request_ip = 1;
             use_requested_ip = extra_requested_ip;
         }
+        uint8_t use_request_ip = (use_requested_ip != 0 || reg.dev_addr.net_bitlen == 0) ? 1 : 0;
 
         update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock), now,
-                     reg.version, reg.os_name, use_request_ip, use_requested_ip );
+                     "", "", use_request_ip, htonl(use_requested_ip) );
 
-        strncpy(ack.version, n2n_sw_version, sizeof(ack.version) - 1);
-        strncpy(ack.os_name, n2n_sw_osName, sizeof(ack.os_name) - 1);
-
-        /* Set IP support capability flags */
-        ack.sn_ipv4_support = (sss->ipv4_available ? 1 : 0);
-        ack.sn_ipv6_support = (sss->ipv6_available ? 1 : 0);
-
-        /* Collect community member information */
-        if (reg.request_ip) {
-            collect_community_peers(sss, cmn.community, &ack);
-
-            /* Set assigned IP */
+        /* Set assigned IP in ACK */
+        if (use_request_ip) {
             struct peer_info *edge_peer = find_peer_by_mac(sss->edges, reg.edgeMac);
             if (edge_peer && edge_peer->assigned_ip) {
-                ack.assigned_ip = htonl(edge_peer->assigned_ip);
+                ack.dev_addr.net_addr = htonl(edge_peer->assigned_ip);
+                ack.dev_addr.net_bitlen = 24;
             }
         }
 

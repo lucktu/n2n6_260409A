@@ -38,6 +38,11 @@ typedef uint8_t n2n_cookie_t[N2N_COOKIE_SIZE];
 
 typedef char    n2n_sock_str_t[N2N_SOCKBUF_SIZE];       /* tracing string buffer */
 
+typedef struct n2n_ip_subnet {
+    uint32_t    net_addr;   /* Host order IP address. */
+    uint8_t     net_bitlen; /* Subnet prefix length. */
+} n2n_ip_subnet_t;
+
 enum n2n_pc
 {
     n2n_ping=0,                 /* Not used */
@@ -150,11 +155,8 @@ struct n2n_REGISTER_SUPER
 {
     n2n_cookie_t        cookie;         /* Link REGISTER_SUPER and REGISTER_SUPER_ACK */
     n2n_mac_t           edgeMac;        /* MAC to register with edge sending socket */
+    n2n_ip_subnet_t     dev_addr;       /* IP address of the tuntap adapter (net_addr=0 to request auto-assign) */
     n2n_auth_t          auth;           /* Authentication scheme and tokens */
-    char                version[8];    /* edge version string */
-    char                os_name[16];    /* operating system name */
-    uint8_t             request_ip;     /* Request IP allocation flag */
-    uint32_t            requested_ip;   /* Requested IP address */
 };
 
 typedef struct n2n_REGISTER_SUPER n2n_REGISTER_SUPER_t;
@@ -165,28 +167,12 @@ struct n2n_REGISTER_SUPER_ACK
 {
     n2n_cookie_t        cookie;         /* Return cookie from REGISTER_SUPER */
     n2n_mac_t           edgeMac;        /* MAC registered to edge sending socket */
+    n2n_ip_subnet_t     dev_addr;       /* Assigned IP address */
     uint16_t            lifetime;       /* How long the registration will live */
     n2n_sock_t          sock;           /* Sending sockets associated with edgeMac */
 
-    /* The packet format provides additional supernode definitions here.
-     * uint8_t count, then for each count there is one
-     * n2n_sock_t.
-     */
-    uint8_t             num_sn;           /* Number of supernodes that were send
-                                           * even if we cannot store them all. If
-                                           * non-zero then sn_bak is valid. */
-    n2n_sock_t          sn_bak;           /* Socket of the first backup supernode */
-    char                version[16];      /* supernode version string */
-    char                os_name[16];      /* supernode OS name */
-    uint8_t             sn_ipv4_support;  /* 0=not supported, 1=supported */
-    uint8_t             sn_ipv6_support;  /* 0=not supported, 1=supported */
-    uint32_t            assigned_ip;      /* Assigned IP address */
-    uint8_t             peer_count;       /* Number of members in the same group */
-    n2n_mac_t           peer_macs[16];    /* List of MAC addresses of group members */
-    uint32_t            peer_ips[16];     /* List of IP addresses of group members */
-    n2n_sock_t          peer_pub_ips[16]; /* List of public IP addresses of group members */
-    char                peer_versions[16][8];    /* Version strings */
-    char                peer_os_names[16][16];   /* OS name strings */
+    uint8_t             num_sn;         /* Number of backup supernodes */
+    n2n_sock_t          sn_bak;         /* Socket of the first backup supernode */
 };
 
 typedef struct n2n_REGISTER_SUPER_ACK n2n_REGISTER_SUPER_ACK_t;

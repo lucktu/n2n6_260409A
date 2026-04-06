@@ -26,6 +26,7 @@
 #include "n2n.h"
 #include "n2n_transforms.h"
 #include "speck.h"
+#include "pearson.h"
 #include "assert.h"
 #include "minilzo.h"
 #include "random.h"
@@ -404,6 +405,8 @@ static int edge_init(n2n_edge_t * eee)
         return(-1);
     }
 
+    pearson_hash_init();
+
     return(0);
 }
 
@@ -778,22 +781,12 @@ static void send_register_super( n2n_edge_t * eee,
     memcpy( reg.cookie, eee->last_cookie, N2N_COOKIE_SIZE );
     reg.auth.scheme=0; /* No auth yet */
 
-    strncpy(reg.version, n2n_sw_version, sizeof(reg.version) - 1);
-    strncpy(reg.os_name, n2n_sw_osName, sizeof(reg.os_name) - 1);
-
     idx=0;
     encode_mac( reg.edgeMac, &idx, eee->device.mac_addr );
 
-    if (default_ip_assignment) {
-        reg.request_ip = 1;
-        reg.requested_ip = 0;
-    } else if (eee->device.ip_addr != 0) {
-        reg.request_ip = 1;
-        reg.requested_ip = eee->device.ip_addr;
-    } else {
-        reg.request_ip = 0;
-        reg.requested_ip = 0;
-    }
+    /* Fill dev_addr: net_addr=0 means request auto-assign from supernode */
+    reg.dev_addr.net_addr = default_ip_assignment ? 0 : ntohl(eee->device.ip_addr);
+    reg.dev_addr.net_bitlen = eee->device.ip_prefixlen;
 
     idx=0;
     encode_REGISTER_SUPER( pktbuf, &idx, &cmn, &reg );
@@ -2060,47 +2053,28 @@ static void readFromIPSocket( n2n_edge_t * eee )
 					eee->sn_wait=0;
 					eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS; /* refresh because we got a response */
 
-					if (default_ip_assignment && ra.assigned_ip != 0) {
-					  uint32_t assigned_ip = ntohl(ra.assigned_ip);
-					 char assigned_ip_str[16];
-
-					snprintf(assigned_ip_str, sizeof(assigned_ip_str),
-								  "10.64.0.%u", assigned_ip & 0xFF);
-
-					 struct in_addr addr;
-					 inet_pton(AF_INET, assigned_ip_str, &addr);
+					if (default_ip_assignment && ra.dev_addr.net_addr != 0) {
+					  struct in_addr addr;
+					  addr.s_addr = htonl(ra.dev_addr.net_addr);
+					  char assigned_ip_str[INET_ADDRSTRLEN];
+					  inet_ntop(AF_INET, &addr, assigned_ip_str, sizeof(assigned_ip_str));
 
 					 /* Only show report on first time or when IP changes */
 					 int ip_changed = (eee->device.ip_addr != addr.s_addr);
 
 					 if (ip_changed) {
 						 eee->device.ip_addr = addr.s_addr;
+						 eee->device.ip_prefixlen = ra.dev_addr.net_bitlen ? ra.dev_addr.net_bitlen : 24;
 
 							if (set_ipaddress(&eee->device, 1) < 0) {
 							   traceEvent(TRACE_ERROR, "Failed to configure TAP interface with assigned IP");
 						 } else {
-							  traceEvent(TRACE_NORMAL, "TAP interface configured with IP %s", assigned_ip_str);
+							  traceEvent(TRACE_NORMAL, "TAP interface configured with IP %s/%u", assigned_ip_str, eee->device.ip_prefixlen);
 							}
 					 }
 
 					  /* Only show report on first time or when IP changes */
 					 if (!first_ip_report_shown || ip_changed) {
-						 if (ra.peer_count > 0) {
-							 traceEvent(TRACE_NORMAL, "Community members (%u):", ra.peer_count);
-							 for (int i = 0; i < ra.peer_count && i < 16; i++) {
-								 macstr_t mac_buf;
-								 uint32_t peer_ip = ntohl(ra.peer_ips[i]);
-								 char peer_ip_str[16];
-								 n2n_sock_str_t pub_ip_str;
-
-								 snprintf(peer_ip_str, sizeof(peer_ip_str), "10.64.0.%u", peer_ip & 0xFF);
-
-								 traceEvent(TRACE_NORMAL, "  Private IP: %s, Public IP: %s",
-											   peer_ip_str,
-											   sock_to_cstr(pub_ip_str, &ra.peer_pub_ips[i]));
-							 }
-						 }
-
 						 first_ip_report_shown = 1;
 					 }
 					}
@@ -2130,57 +2104,11 @@ static void readFromIPSocket( n2n_edge_t * eee )
                     eee->register_lifetime = max( eee->register_lifetime, REGISTER_SUPER_INTERVAL_MIN );
                     eee->register_lifetime = min( eee->register_lifetime, REGISTER_SUPER_INTERVAL_MAX );
 
-                    /* Store supernode version - CRITICAL: Must be inside cookie check */
-                    if (strlen(ra.version) > 0) {
-                        strncpy(eee->supernode_version, ra.version, sizeof(eee->supernode_version) - 1);
-                        eee->supernode_version[sizeof(eee->supernode_version) - 1] = '\0';
-                    } else {
-                        strcpy(eee->supernode_version, "unknown");
-                    }
+                    /* Store supernode version */
+                    strcpy(eee->supernode_version, "cnn2n");
 
-                    /* Store supernode IP support capabilities */
-                    eee->sn_ipv4_support = ra.sn_ipv4_support;
-                    eee->sn_ipv6_support = ra.sn_ipv6_support;
-
-                    /* Update existing P2P peers in known_peers */
-                    for (int i = 0; i < ra.peer_count && i < 16; i++) {
-                        struct peer_info *peer = find_peer_by_mac(eee->known_peers, ra.peer_macs[i]);
-
-                        if (peer) {
-                            /* Update known peer info */
-                            peer->assigned_ip = ntohl(ra.peer_ips[i]);
-                            peer->last_seen = time(NULL);
-                            if (strlen(peer->version) == 0) {
-                                strncpy(peer->version, ra.peer_versions[i], sizeof(peer->version) - 1);
-                                peer->version[sizeof(peer->version) - 1] = '\0';
-                            }
-                        }
-                    }
-
-                    /* Clear only pending_peers, not known_peers */
+                    /* Clear pending_peers */
                     clear_peer_list(&(eee->pending_peers));
-
-                    /* Add new peers to pending_peers */
-                    for (int i = 0; i < ra.peer_count && i < 16; i++) {
-                        /* Skip if already in known_peers */
-                        if (find_peer_by_mac(eee->known_peers, ra.peer_macs[i])) {
-                            continue;
-                        }
-
-                        /* Create new peer and add to pending_peers */
-                        struct peer_info *peer = (struct peer_info*) calloc(1, sizeof(struct peer_info));
-                        memcpy(peer->mac_addr, ra.peer_macs[i], N2N_MAC_SIZE);
-                        peer->sock = ra.peer_pub_ips[i];
-                        peer->assigned_ip = ntohl(ra.peer_ips[i]);
-                        peer->last_seen = time(NULL);
-                        strncpy(peer->version, ra.peer_versions[i], sizeof(peer->version) - 1);
-                        peer->version[sizeof(peer->version) - 1] = '\0';
-                        strncpy(peer->os_name, ra.peer_os_names[i], sizeof(peer->os_name) - 1);
-                        peer->os_name[sizeof(peer->os_name) - 1] = '\0';
-                        memcpy(peer->community_name, eee->community_name, N2N_COMMUNITY_SIZE);
-
-                        peer_list_add(&(eee->pending_peers), peer);
-                    }
                 }
                 else
                 {
@@ -2395,7 +2323,7 @@ static int scan_address( char * ip_addr, size_t addr_size,
     else
     {
         /* colon is not present */
-        strncpy( ip_addr, s, addr_end - 1 );
+        strncpy( ip_addr, s, addr_end );
     }
 
     return retval;
@@ -3075,6 +3003,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
       }
   } else if (encrypt_mode == 1) {
       traceEvent(TRACE_NORMAL, "Using no encryption");
+      eee.null_transop = 1;
   } else if (encrypt_mode == 2) {
 				  // B2 - Twofish
 			   traceEvent(TRACE_NORMAL, "Using Twofish encryption");
