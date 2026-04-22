@@ -1058,10 +1058,21 @@ static void advance_punch_phase( n2n_edge_t * eee, struct peer_info * peer, time
         phase++;
     }
     if ( phase >= PUNCH_PHASE_DONE ) {
+        /* All phases exhausted: move peer to known_peers for relay */
         peer->punch_failed = 1;
         peer->punch_reset_time = now;
         traceEvent(TRACE_NORMAL, "PsP (supernode relay) for %s - all punch phases exhausted",
                    PEER_ID(mac_tmp, peer));
+        /* Move from pending_peers to known_peers so find_peer_destination can find it */
+        if ( eee->pending_peers == peer ) {
+            eee->pending_peers = peer->next;
+        } else {
+            struct peer_info *prev = eee->pending_peers;
+            while ( prev && prev->next != peer ) prev = prev->next;
+            if ( prev ) prev->next = peer->next;
+        }
+        peer->next = eee->known_peers;
+        eee->known_peers = peer;
         return;
     }
     peer->punch_phase      = phase;
@@ -1090,10 +1101,21 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
         phase++;
     }
     if ( phase >= PUNCH_PHASE_DONE ) {
+        /* No punch possible: move peer to known_peers for relay */
         peer->punch_failed = 1;
         peer->punch_reset_time = n2n_now();
         traceEvent(TRACE_NORMAL, "PsP (supernode relay) for %s - no punch possible",
                    PEER_ID(mac_tmp, peer));
+        /* Move from pending_peers to known_peers so find_peer_destination can find it */
+        if ( eee->pending_peers == peer ) {
+            eee->pending_peers = peer->next;
+        } else {
+            struct peer_info *prev = eee->pending_peers;
+            while ( prev && prev->next != peer ) prev = prev->next;
+            if ( prev ) prev->next = peer->next;
+        }
+        peer->next = eee->known_peers;
+        eee->known_peers = peer;
         return;
     }
     peer->punch_phase      = phase;
@@ -1144,28 +1166,8 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 free(tmp);
                 continue;
             }
-        } else if ( scan->punch_failed &&
-                    (now - scan->punch_reset_time) > 300 )
-        {
-            /* Retry full punch cycle every 5 minutes */
-            scan->punch_retry_count++;
-            if ( scan->punch_retry_count > 3 ) {
-                traceEvent(TRACE_NORMAL, "Giving up on %s after %u retries, removing",
-                           PEER_ID(mac_tmp, scan), scan->punch_retry_count);
-                struct peer_info *tmp = scan;
-                if ( prev ) prev->next = scan->next;
-                else eee->pending_peers = scan->next;
-                scan = scan->next;
-                free(tmp);
-                continue;
-            }
-            scan->punch_failed     = 0;
-            scan->punch_start_time = 0;
-            scan->punch_phase      = PUNCH_PHASE_LAN;
-            traceEvent(TRACE_INFO, "Retrying punch for %s (attempt %u/3)",
-                       PEER_ID(mac_tmp, scan), scan->punch_retry_count);
-            start_punch(eee, scan);
         }
+        /* Note: punch_failed peers are now in known_peers, not pending_peers */
         prev = scan;
         scan = scan->next;
     }
@@ -1180,6 +1182,41 @@ static void update_peer_address(n2n_edge_t * eee,
                                 const n2n_mac_t mac,
                                 const n2n_sock_t * peer,
                                 time_t when);
+
+/** Check known_peers for punch_failed peers and retry punch periodically. */
+static void check_relay_retry( n2n_edge_t * eee, time_t now )
+{
+    struct peer_info *scan = eee->known_peers;
+    MACSTR_TMP(mac_tmp);
+    
+    while ( scan ) {
+        if ( scan->punch_failed && (now - scan->punch_reset_time) > 300 ) {
+            /* Retry punch every 5 minutes for relay peers */
+            scan->punch_retry_count++;
+            if ( scan->punch_retry_count <= 3 ) {
+                traceEvent(TRACE_INFO, "Retrying punch for relay peer %s (attempt %u/3)",
+                           PEER_ID(mac_tmp, scan), scan->punch_retry_count);
+                /* Move to pending_peers for re-punch */
+                /* First remove from known_peers */
+                struct peer_info *prev = NULL, *s = eee->known_peers;
+                while ( s && s != scan ) { prev = s; s = s->next; }
+                if ( s ) {
+                    if ( prev ) prev->next = scan->next;
+                    else eee->known_peers = scan->next;
+                    /* Add to pending_peers */
+                    scan->next = eee->pending_peers;
+                    eee->pending_peers = scan;
+                    /* Reset punch state */
+                    scan->punch_failed = 0;
+                    scan->punch_start_time = 0;
+                    scan->punch_phase = PUNCH_PHASE_LAN;
+                    start_punch(eee, scan);
+                }
+            }
+        }
+        scan = scan->next;
+    }
+}
 
 /** Send keepalive PROBEs to known_peers that have been silent too long,
  *  and remove peers that have failed KEEPALIVE_MAX_FAILS times. */
@@ -1667,9 +1704,13 @@ static int find_peer_destination(n2n_edge_t * eee,
 
     while(scan != NULL) {
         if((scan->last_seen > 0) &&
-           !scan->punch_failed &&
            (memcmp(mac_address, scan->mac_addr, N2N_MAC_SIZE) == 0))
         {
+            /* Peer found in known_peers */
+            if (scan->punch_failed) {
+                /* Using relay: return supernode address */
+                break;
+            }
             if (scan->last_probe_sent > 0 && (now - scan->last_seen) > KEEPALIVE_TIMEOUT_SECONDS)
                 break; /* keepalive timed out, fall back to supernode */
             /* Prefer IPv6 direct if available, else IPv4 */
@@ -3948,6 +3989,7 @@ static int run_loop(n2n_edge_t * eee )
         check_punch_timeouts(eee, nowTime);
 
         PEERS_LOCK(eee);
+        check_relay_retry(eee, nowTime);
         check_keepalive(eee, nowTime);
         numPurged =  purge_expired_registrations( &(eee->known_peers) );
         numPurged += purge_expired_registrations( &(eee->pending_peers) );
