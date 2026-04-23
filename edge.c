@@ -35,6 +35,13 @@
 
 #ifdef _WIN32
 #include <iphlpapi.h>
+/* Interface types for filtering virtual interfaces */
+#ifndef IF_TYPE_PPP
+#define IF_TYPE_PPP 23
+#endif
+#ifndef IF_TYPE_TUNNEL
+#define IF_TYPE_TUNNEL 131
+#endif
 #endif
 
 /* reallocarray compatibility for older glibc versions */
@@ -105,7 +112,17 @@ static int initial_connection_complete = 0;
 /* Global flag set by signal handler to request graceful shutdown */
 static volatile int g_edge_running = 1;
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <signal.h>
+/* Windows console control handler for graceful shutdown */
+static BOOL WINAPI win_console_handler(DWORD fdwCtrlType) {
+    if (fdwCtrlType == CTRL_C_EVENT || fdwCtrlType == CTRL_BREAK_EVENT || fdwCtrlType == CTRL_CLOSE_EVENT) {
+        g_edge_running = 0;
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
 #include <signal.h>
 static void edge_signal_handler(int sig) {
     (void)sig;
@@ -168,6 +185,8 @@ struct n2n_edge
 
     n2n_sock_t          local_sock;             /**< LAN address for same-NAT direct connect */
     int                 local_sock_ena;         /**< 1 if local_sock is valid */
+    n2n_sock_t          local_socks[3];         /**< Additional local LAN addresses (up to 3) */
+    int                 local_socks_count;      /**< Number of valid entries in local_socks */
 
     /* UPnP/NAT-PMP */
     uint16_t            upnp_mapped_port;       /**< External port mapped via UPnP/NAT-PMP, 0 if none */
@@ -709,11 +728,13 @@ static void send_register( n2n_edge_t * eee,
 
 /** Automatically detect LAN IP address for same-NAT direct connect.
  *  Uses connect()+getsockname() to find the exit IP towards supernode.
- *  Only uses the result if it's a private IP address. */
+ *  Only uses the result if it's a private IP address.
+ *  Also discovers additional local IPs from all interfaces. */
 static void set_localip( n2n_edge_t * eee )
 {
     n2n_sock_str_t sockbuf;
     eee->local_sock_ena = 0;
+    eee->local_socks_count = 0;
 
     struct sockaddr_in sa2;
     socklen_t sa2_len = sizeof(sa2);
@@ -761,6 +782,91 @@ static void set_localip( n2n_edge_t * eee )
                    sock_to_cstr(sockbuf, &eee->local_sock));
     else
         traceEvent(TRACE_WARNING, "set_localip: no private LAN address found");
+
+    /* Discover additional local IPs from all interfaces */
+#ifdef _WIN32
+    /* Windows: use GetAdaptersAddresses */
+    ULONG outBufLen = 15000;
+    PIP_ADAPTER_ADDRESSES pAddresses = (PIP_ADAPTER_ADDRESSES)malloc(outBufLen);
+    if (pAddresses) {
+        if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                 NULL, pAddresses, &outBufLen) == ERROR_SUCCESS) {
+            PIP_ADAPTER_ADDRESSES pCurrAddresses = pAddresses;
+            while (pCurrAddresses && eee->local_socks_count < 3) {
+                PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurrAddresses->FirstUnicastAddress;
+                while (pUnicast && eee->local_socks_count < 3) {
+                    if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+                        struct sockaddr_in *pAddr = (struct sockaddr_in *)pUnicast->Address.lpSockaddr;
+                        uint32_t addr_ip = ntohl(pAddr->sin_addr.s_addr);
+                        /* Only private IPs, skip the one already in local_sock, skip n2n interface */
+                        int is_private = ((addr_ip >> 24) == 10) ||
+                                         ((addr_ip & 0xFFF00000) == 0xAC100000) ||
+                                         ((addr_ip >> 16) == (192 << 8 | 168));
+                        if (is_private && addr_ip != ntohl(eee->device.ip_addr)) {
+                            /* Skip if same as local_sock */
+                            if (eee->local_sock_ena && memcmp(&pAddr->sin_addr.s_addr, eee->local_sock.addr.v4, IPV4_SIZE) == 0) {
+                                pUnicast = pUnicast->Next;
+                                continue;
+                            }
+                            /* Skip virtual interfaces (VPN, etc.) - check interface type */
+                            if (pCurrAddresses->IfType == IF_TYPE_PPP || 
+                                pCurrAddresses->IfType == IF_TYPE_TUNNEL) {
+                                pUnicast = pUnicast->Next;
+                                continue;
+                            }
+                            eee->local_socks[eee->local_socks_count].family = AF_INET;
+                            eee->local_socks[eee->local_socks_count].port = local_port;
+                            memcpy(eee->local_socks[eee->local_socks_count].addr.v4, &pAddr->sin_addr.s_addr, IPV4_SIZE);
+                            eee->local_socks_count++;
+                            traceEvent(TRACE_INFO, "Additional local IP: %s",
+                                       sock_to_cstr(sockbuf, &eee->local_socks[eee->local_socks_count-1]));
+                        }
+                    }
+                    pUnicast = pUnicast->Next;
+                }
+                pCurrAddresses = pCurrAddresses->Next;
+            }
+        }
+        free(pAddresses);
+    }
+#else
+    /* Linux/Unix: use getifaddrs */
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == 0) {
+        for (ifa = ifaddr; ifa != NULL && eee->local_socks_count < 3; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+            /* Skip loopback and n2n interface */
+            if (ifa->ifa_flags & IFF_LOOPBACK)
+                continue;
+            if (strncmp(ifa->ifa_name, "n2n", 3) == 0 || strncmp(ifa->ifa_name, "tun", 3) == 0)
+                continue;
+            /* Skip interfaces without broadcast (point-to-point, VPN) */
+            if (!(ifa->ifa_flags & IFF_BROADCAST))
+                continue;
+            
+            struct sockaddr_in *pAddr = (struct sockaddr_in *)ifa->ifa_addr;
+            uint32_t addr_ip = ntohl(pAddr->sin_addr.s_addr);
+            int is_private = ((addr_ip >> 24) == 10) ||
+                             ((addr_ip & 0xFFF00000) == 0xAC100000) ||
+                             ((addr_ip >> 16) == (192 << 8 | 168));
+            if (is_private && addr_ip != ntohl(eee->device.ip_addr)) {
+                /* Skip if same as local_sock */
+                if (eee->local_sock_ena && memcmp(&pAddr->sin_addr.s_addr, eee->local_sock.addr.v4, IPV4_SIZE) == 0)
+                    continue;
+                eee->local_socks[eee->local_socks_count].family = AF_INET;
+                eee->local_socks[eee->local_socks_count].port = local_port;
+                memcpy(eee->local_socks[eee->local_socks_count].addr.v4, &pAddr->sin_addr.s_addr, IPV4_SIZE);
+                eee->local_socks_count++;
+                traceEvent(TRACE_INFO, "Additional local IP: %s",
+                           sock_to_cstr(sockbuf, &eee->local_socks[eee->local_socks_count-1]));
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+#endif
+    if (eee->local_socks_count > 0)
+        traceEvent(TRACE_NORMAL, "Found %d additional local IP(s) for LAN direct", eee->local_socks_count);
 }
 
 /** Send a QUERY_PEER packet to supernode asking for target's address. */
@@ -1006,7 +1112,7 @@ static int is_private_ipv4( const n2n_sock_t * sock )
  *
  *  Phase semantics:
  *  PUNCH_PHASE_LAN  - peer is reachable on the local network (same subnet as
- *                     our local_sock).  Use sock_lan if provided, else sock.
+ *                     any of our local addresses).  Use sock_lan if provided, else sock.
  *  PUNCH_PHASE_IPV6 - both sides have IPv6; use peer->sock6.
  *  PUNCH_PHASE_IPV4 - peer has a routable public IPv4 address; use peer->sock.
  */
@@ -1016,18 +1122,26 @@ static const n2n_sock_t * punch_phase_sock( const n2n_edge_t * eee,
 {
     switch (phase) {
     case PUNCH_PHASE_LAN:
-        /* LAN direct: peer's public address is on the same subnet as our
-         * local interface.  This covers both the classic "same router" case
-         * and the case where the peer has no separate LAN address because
-         * the supernode already sees its LAN IP as the public address. */
-        if ( eee->local_sock_ena && peer->sock.family == AF_INET ) {
-            /* Prefer explicit LAN address if supernode provided one */
-            if ( peer->sock_lan.family == AF_INET &&
-                 same_subnet(&eee->local_sock, &peer->sock_lan) )
-                return &peer->sock_lan;
-            /* Fall back to public address if it is on our local subnet */
-            if ( same_subnet(&eee->local_sock, &peer->sock) )
-                return &peer->sock;
+        /* LAN direct: check if peer's address is on the same subnet as any of our local addresses */
+        if ( peer->sock.family == AF_INET ) {
+            /* Check against primary local_sock */
+            if ( eee->local_sock_ena ) {
+                /* Prefer explicit LAN address if supernode provided one */
+                if ( peer->sock_lan.family == AF_INET &&
+                     same_subnet(&eee->local_sock, &peer->sock_lan) )
+                    return &peer->sock_lan;
+                /* Check public address against primary local */
+                if ( same_subnet(&eee->local_sock, &peer->sock) )
+                    return &peer->sock;
+            }
+            /* Check against additional local addresses */
+            for (int i = 0; i < eee->local_socks_count; i++) {
+                if ( peer->sock_lan.family == AF_INET &&
+                     same_subnet(&eee->local_socks[i], &peer->sock_lan) )
+                    return &peer->sock_lan;
+                if ( same_subnet(&eee->local_socks[i], &peer->sock) )
+                    return &peer->sock;
+            }
         }
         return NULL;
     case PUNCH_PHASE_IPV6:
@@ -3289,6 +3403,9 @@ int main(int argc, char* argv[])
      * graceful shutdown and UPnP port cleanup, even during startup. */
     signal(SIGTERM, edge_signal_handler);
     signal(SIGINT,  edge_signal_handler);
+#else
+    /* Windows: register console control handler for graceful shutdown */
+    SetConsoleCtrlHandler(win_console_handler, TRUE);
 #endif
 
     if (-1 == edge_init(&eee) ) {
