@@ -1113,185 +1113,82 @@ static int is_private_ipv4( const n2n_sock_t * sock )
            ((ip >> 16) == (192 << 8 | 168));
 }
 
-/** Return the socket address to use for the current punch phase of a peer.
- *  Returns NULL if this phase is not available for this peer / local config.
- *
- *  Phase semantics:
- *  PUNCH_PHASE_LAN  - peer is reachable on the local network (same subnet as
- *                     any of our local addresses).  Use sock_lan if provided, else sock.
- *  PUNCH_PHASE_IPV6 - both sides have IPv6; use peer->sock6.
- *  PUNCH_PHASE_IPV4 - peer has a routable public IPv4 address; use peer->sock.
- */
-static const n2n_sock_t * punch_phase_sock( const n2n_edge_t * eee,
-                                             const struct peer_info * peer,
-                                             uint8_t phase )
-{
-    switch (phase) {
-    case PUNCH_PHASE_LAN:
-        /* LAN direct: check if peer's address is on the same subnet as any of our local addresses */
-        if ( peer->sock.family == AF_INET ) {
-            /* Check against primary local_sock */
-            if ( eee->local_sock_ena ) {
-                /* Prefer explicit LAN address if supernode provided one */
-                if ( peer->sock_lan.family == AF_INET &&
-                     same_subnet(&eee->local_sock, &peer->sock_lan) )
-                    return &peer->sock_lan;
-                /* Check public address against primary local */
-                if ( same_subnet(&eee->local_sock, &peer->sock) )
-                    return &peer->sock;
-            }
-            /* Check against additional local addresses */
-            for (int i = 0; i < eee->local_socks_count; i++) {
-                if ( peer->sock_lan.family == AF_INET &&
-                     same_subnet(&eee->local_socks[i], &peer->sock_lan) )
-                    return &peer->sock_lan;
-                if ( same_subnet(&eee->local_socks[i], &peer->sock) )
-                    return &peer->sock;
-            }
-        }
-        return NULL;
-    case PUNCH_PHASE_IPV6:
-        if ( peer->sock6.family == AF_INET6 && eee->udp_sock6 != -1 )
-            return &peer->sock6;
-        return NULL;
-    case PUNCH_PHASE_IPV4:
-        /* WAN punch: only useful when peer's IPv4 address is a real public
-         * address.  If it is a private address the peer is behind NAT and
-         * we cannot reach it directly via IPv4 WAN. */
-        if ( peer->sock.family == AF_INET && !is_private_ipv4(&peer->sock) )
-            return &peer->sock;
-        return NULL;
-    default:
-        return NULL;
-    }
-}
-
-/** Advance peer->punch_phase to the next available phase.
- *  Sets punch_failed=1 if no more phases are available. */
-static void advance_punch_phase( n2n_edge_t * eee, struct peer_info * peer, time_t now )
-{
-    MACSTR_TMP(mac_tmp);
-    uint8_t phase = peer->punch_phase + 1;
-    while ( phase < PUNCH_PHASE_DONE ) {
-        if ( punch_phase_sock(eee, peer, phase) != NULL )
-            break;
-        phase++;
-    }
-    if ( phase >= PUNCH_PHASE_DONE ) {
-        /* All phases exhausted: move peer to known_peers for relay */
-        /* Only report if not already in relay mode (state change) */
-        if (!peer->punch_failed) {
-            traceEvent(TRACE_INFO, "PsP (supernode relay) for %s - all punch phases exhausted",
-                       PEER_ID(mac_tmp, peer));
-        }
-        peer->punch_failed = 1;
-        peer->punch_reset_time = now;
-        /* Move from pending_peers to known_peers so find_peer_destination can find it */
-        if ( eee->pending_peers == peer ) {
-            eee->pending_peers = peer->next;
-        } else {
-            struct peer_info *prev = eee->pending_peers;
-            while ( prev && prev->next != peer ) prev = prev->next;
-            if ( prev ) prev->next = peer->next;
-        }
-        peer->next = eee->known_peers;
-        eee->known_peers = peer;
-        return;
-    }
-    peer->punch_phase      = phase;
-    peer->punch_start_time = now;
-    peer->last_punch_probe = now;
-    const n2n_sock_t *sock = punch_phase_sock(eee, peer, phase);
-    n2n_sock_str_t sb;
-    traceEvent(TRACE_INFO, "punch phase %u for %s -> %s",
-               phase, PEER_ID(mac_tmp, peer), sock_to_cstr(sb, sock));
-    send_probe(eee, sock, peer->mac_addr);
-    send_register(eee, &eee->supernode);
-}
-
-/** Initialise punch state and start from the first available phase. */
+/** Start hole-punch for a peer: send PROBE directly, record punch start time.
+ *  Simplified version: direct punch to peer's public address. */
 static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 {
     MACSTR_TMP(mac_tmp);
 
-    if ( peer->punch_failed ) return;
+    if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    uint8_t phase = PUNCH_PHASE_LAN;
-    while ( phase < PUNCH_PHASE_DONE ) {
-        if ( punch_phase_sock(eee, peer, phase) != NULL )
-            break;
-        phase++;
-    }
-    if ( phase >= PUNCH_PHASE_DONE ) {
-        /* No punch possible: move peer to known_peers for relay */
-        peer->punch_failed = 1;
-        peer->punch_reset_time = n2n_now();
-        traceEvent(TRACE_NORMAL, "PsP (supernode relay) for %s - no punch possible",
-                   PEER_ID(mac_tmp, peer));
-        /* Move from pending_peers to known_peers so find_peer_destination can find it */
-        if ( eee->pending_peers == peer ) {
-            eee->pending_peers = peer->next;
-        } else {
-            struct peer_info *prev = eee->pending_peers;
-            while ( prev && prev->next != peer ) prev = prev->next;
-            if ( prev ) prev->next = peer->next;
-        }
-        peer->next = eee->known_peers;
-        eee->known_peers = peer;
-        return;
-    }
-    peer->punch_phase      = phase;
+    /* Don't punch if same public IP (same LAN) - handled separately. */
+    if ( !is_empty_ip_address(&eee->my_public_sock) &&
+        same_public_ip(&eee->my_public_sock, &peer->sock) ) return;
+
+    /* Skip punch if address family mismatch - no direct path possible */
+    if ( peer->sock.family != eee->supernode.family ) return;
+
     peer->punch_start_time = n2n_now();
     peer->last_punch_probe = peer->punch_start_time;
-    const n2n_sock_t *sock = punch_phase_sock(eee, peer, phase);
-    n2n_sock_str_t sb;
-    traceEvent(TRACE_INFO, "hole-punch started for %s phase %u -> %s",
-               PEER_ID(mac_tmp, peer), phase, sock_to_cstr(sb, sock));
-    send_probe(eee, sock, peer->mac_addr);
-    send_register(eee, &eee->supernode);
+    
+    traceEvent(TRACE_INFO, "hole-punch started for %s -> %s",
+               PEER_ID(mac_tmp, peer), sock_to_cstr((n2n_sock_str_t){0}, &peer->sock));
+    
+    send_probe(eee, &peer->sock, peer->mac_addr);
 }
 
-/** Check punch timeouts: advance phase on timeout, relay only after all phases fail. */
+/** Check punch timeouts in pending_peers: give up after PUNCH_TIMEOUT seconds,
+ *  but reset and retry every 5 minutes in case NAT conditions change. */
 static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 {
     struct peer_info * scan = eee->pending_peers;
-    struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
+    
     while ( scan ) {
+        if ( scan->sock_lan.family != 0 && scan->sock_lan.port != 0 &&
+             !scan->lan_punch_done &&
+             scan->lan_punch_start != 0 &&
+             (now - scan->lan_punch_start) >= 15 )
+        {
+            scan->lan_punch_done = 1;
+            traceEvent(TRACE_INFO, "LAN punch timeout for %s - trying WAN",
+                       PEER_ID(mac_tmp, scan));
+            send_register(eee, &scan->sock);
+            send_register(eee, &(eee->supernode));
+            start_punch(eee, scan);
+        }
+
         if ( scan->punch_start_time != 0 && !scan->punch_failed ) {
-            /* Retransmit PROBE every 1s for first 5s of each phase */
             if ( (now - scan->punch_start_time) <= 5 &&
                  (now - scan->last_punch_probe) >= 1 )
             {
-                const n2n_sock_t *sock = punch_phase_sock(eee, scan, scan->punch_phase);
-                if ( sock ) {
-                    send_probe(eee, sock, scan->mac_addr);
+                if ( scan->sock.family == eee->supernode.family ) {
+                    send_probe(eee, &scan->sock, scan->mac_addr);
                     scan->last_punch_probe = now;
                 }
             }
-            /* Phase timeout: advance to next phase */
-            if ( (now - scan->punch_start_time) > PUNCH_PHASE_TIMEOUT ) {
-                traceEvent(TRACE_INFO, "punch phase %u timeout for %s - advancing",
-                           scan->punch_phase, PEER_ID(mac_tmp, scan));
-                advance_punch_phase(eee, scan, now);
-            }
-        } else if ( scan->punch_start_time == 0 && !scan->punch_failed ) {
-            /* Stuck with no punch started and idle too long: remove */
-            if ( scan->last_seen != 0 && (now - scan->last_seen) > 1800 ) {
-                traceEvent(TRACE_NORMAL, "Removing stuck pending peer %s (idle %lus)",
-                           PEER_ID(mac_tmp, scan),
-                           (unsigned long)(now - scan->last_seen));
-                struct peer_info *tmp = scan;
+            if ( (now - scan->punch_start_time) > PUNCH_TIMEOUT ) {
+                scan->punch_failed = 1;
+                scan->punch_reset_time = now;
+                traceEvent(TRACE_NORMAL, "PsP (supernode relay) for %s - P2P punch timeout",
+                           PEER_ID(mac_tmp, scan));
+                struct peer_info *prev = NULL, *p = eee->pending_peers;
+                while ( p && p != scan ) { prev = p; p = p->next; }
                 if ( prev ) prev->next = scan->next;
                 else eee->pending_peers = scan->next;
-                scan = scan->next;
-                free(tmp);
-                continue;
+                scan->next = eee->known_peers;
+                eee->known_peers = scan;
             }
+        } else if ( scan->punch_failed && (now - scan->punch_reset_time) > 300 ) {
+            scan->punch_failed = 0;
+            scan->punch_start_time = 0;
+            scan->lan_punch_done = 0;
+            scan->lan_punch_start = 0;
+            traceEvent(TRACE_INFO, "Retrying P2P punch for %s",
+                       PEER_ID(mac_tmp, scan));
+            start_punch(eee, scan);
         }
-        /* Note: punch_failed peers are now in known_peers, not pending_peers */
-        prev = scan;
         scan = scan->next;
     }
 }
@@ -1314,27 +1211,21 @@ static void check_relay_retry( n2n_edge_t * eee, time_t now )
     
     while ( scan ) {
         if ( scan->punch_failed && (now - scan->punch_reset_time) > 300 ) {
-            /* Retry punch every 5 minutes for relay peers */
             scan->punch_retry_count++;
-            if ( scan->punch_retry_count <= 3 ) {
-                traceEvent(TRACE_INFO, "Retrying punch for relay peer %s (attempt %u/3)",
-                           PEER_ID(mac_tmp, scan), scan->punch_retry_count);
-                /* Move to pending_peers for re-punch */
-                /* First remove from known_peers */
-                struct peer_info *prev = NULL, *s = eee->known_peers;
-                while ( s && s != scan ) { prev = s; s = s->next; }
-                if ( s ) {
-                    if ( prev ) prev->next = scan->next;
-                    else eee->known_peers = scan->next;
-                    /* Add to pending_peers */
-                    scan->next = eee->pending_peers;
-                    eee->pending_peers = scan;
-                    /* Reset punch state */
-                    scan->punch_failed = 0;
-                    scan->punch_start_time = 0;
-                    scan->punch_phase = PUNCH_PHASE_LAN;
-                    start_punch(eee, scan);
-                }
+            traceEvent(TRACE_INFO, "Retrying punch for relay peer %s (attempt %u)",
+                       PEER_ID(mac_tmp, scan), scan->punch_retry_count);
+            struct peer_info *prev = NULL, *s = eee->known_peers;
+            while ( s && s != scan ) { prev = s; s = s->next; }
+            if ( s ) {
+                if ( prev ) prev->next = scan->next;
+                else eee->known_peers = scan->next;
+                scan->next = eee->pending_peers;
+                eee->pending_peers = scan;
+                scan->punch_failed = 0;
+                scan->punch_start_time = 0;
+                scan->lan_punch_done = 0;
+                scan->lan_punch_start = 0;
+                start_punch(eee, scan);
             }
         }
         scan = scan->next;
@@ -1417,24 +1308,16 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                            scan->keepalive_fails, KEEPALIVE_MAX_FAILS);
 
                 if ( scan->keepalive_fails >= KEEPALIVE_MAX_FAILS ) {
-                    traceEvent(TRACE_INFO, "Keepalive: peer %s unreachable, moving to pending for re-punch",
-                               PEER_ID(mac_tmp, scan));
-                    /* Remove from known_peers */
+                    traceEvent(TRACE_NORMAL, "Keepalive: removing peer %s after %u failures",
+                               PEER_ID(mac_tmp, scan),
+                               scan->keepalive_fails);
+                    n2n_mac_t lost_mac;
+                    memcpy(lost_mac, scan->mac_addr, N2N_MAC_SIZE);
                     if ( prev ) prev->next = next;
                     else eee->known_peers = next;
-                    /* Move to pending_peers and re-punch instead of freeing,
-                     * so supernode PEER_INFO can trigger reconnect even if
-                     * the peer's address hasn't changed. */
-                    scan->next             = eee->pending_peers;
-                    eee->pending_peers     = scan;
-                    scan->punch_start_time = 0;
-                    scan->punch_failed     = 0;
-                    scan->punch_phase      = PUNCH_PHASE_LAN;
-                    scan->keepalive_fails  = 0;
-                    scan->last_probe_sent  = 0;
-                    send_query_peer(eee, scan->mac_addr);
-                    start_punch(eee, scan);
+                    free(scan);
                     scan = next;
+                    send_query_peer(eee, lost_mac);
                     continue;
                 }
             }
@@ -1506,10 +1389,17 @@ void try_send_register( n2n_edge_t * eee,
         strncpy(scan->os_name, n2n_sw_osName, sizeof(scan->os_name) - 1);
 
         peer_list_add( &(eee->pending_peers), scan );
+
+        if ( from_supernode ) {
+            send_register(eee, &(scan->sock) );
+            send_register(eee, &(eee->supernode) );
+        } else {
+            send_register(eee, &(scan->sock) );
+        }
+
         start_punch(eee, scan);
 
     } else {
-        /* Already pending: update address, reset and re-punch */
         int changed = 0;
         if (peer->family == AF_INET6) {
             if (sock_equal(&scan->sock6, peer) != 0) { scan->sock6 = *peer; changed = 1; }
@@ -1519,7 +1409,8 @@ void try_send_register( n2n_edge_t * eee,
         if (changed) {
             scan->punch_start_time = 0;
             scan->punch_failed     = 0;
-            scan->punch_phase      = PUNCH_PHASE_LAN;
+            send_register(eee, peer);
+            send_register(eee, &(eee->supernode));
             start_punch(eee, scan);
         } else if ( scan->punch_start_time == 0 && !scan->punch_failed ) {
             start_punch(eee, scan);
@@ -1541,9 +1432,11 @@ void try_send_register_lan( n2n_edge_t * eee,
         if (!scan) return;
 
         memcpy(scan->mac_addr, mac, N2N_MAC_SIZE);
-        scan->sock     = *peer;       /* IPv4 public */
-        scan->sock_lan = *local_sock; /* LAN */
+        scan->sock     = *peer;
+        scan->sock_lan = *local_sock;
         scan->last_seen = n2n_now();
+        scan->lan_punch_start = n2n_now();
+        scan->lan_punch_done  = 0;
 
         peer_list_add( &(eee->pending_peers), scan );
     } else {
@@ -1551,10 +1444,16 @@ void try_send_register_lan( n2n_edge_t * eee,
         scan->sock_lan = *local_sock;
         scan->punch_start_time = 0;
         scan->punch_failed     = 0;
-        scan->punch_phase      = PUNCH_PHASE_LAN;
+        scan->lan_punch_start = n2n_now();
+        scan->lan_punch_done  = 0;
     }
 
-    start_punch(eee, scan);
+    send_register(eee, local_sock);
+    {
+        MACSTR_TMP(mac_tmp2);
+        traceEvent(TRACE_INFO, "LAN punch started for %s",
+                   macaddr_str(mac_tmp2, mac));
+    }
 }
 
 /** Update the last_seen time for this peer, or get registered. */
@@ -2680,7 +2579,6 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                             else curr->sock = *orig_sender;
                             curr->punch_start_time = 0;
                             curr->punch_failed     = 0;
-                            curr->punch_phase      = PUNCH_PHASE_LAN;
                             curr->last_probe_sent  = 0;
                             curr->keepalive_fails  = 0;
                             curr->next = eee->pending_peers;
@@ -2813,28 +2711,72 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
 
             PEERS_LOCK(eee);
 
-            /* Helper: populate all address slots of a peer_info from PEER_INFO packet */
-#define FILL_PEER_ADDRS(pp) do { \
-    if (pi.sockets[0].family == AF_INET) \
-        (pp)->sock = pi.sockets[0]; \
-    if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6) \
-        (pp)->sock6 = pi.sock6; \
-    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) && \
-        pi.sockets[1].family == AF_INET && pi.sockets[1].port != 0) \
-        (pp)->sock_lan = pi.sockets[1]; \
-    if (pi.version[0] != '\0') \
-        strncpy((pp)->version, pi.version, sizeof((pp)->version) - 1); \
-    if (pi.os_name[0] != '\0') \
-        strncpy((pp)->os_name, pi.os_name, sizeof((pp)->os_name) - 1); \
-} while(0)
+            struct peer_info *known = find_peer_by_mac(eee->known_peers, pi.mac);
+            if (!known) {
+                struct peer_info *pp = find_peer_by_mac(eee->pending_peers, pi.mac);
+                if (!pp) {
+                    if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
+                        pi.sock6.family == AF_INET6 &&
+                        eee->supernode.family == AF_INET6)
+                    {
+                        try_send_register(eee, 1, pi.mac, &pi.sock6);
+                    }
+                    else if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                        pi.sockets[1].family != 0 && pi.sockets[1].port != 0 &&
+                        eee->my_public_sock.family == AF_INET &&
+                        pi.sockets[0].family == AF_INET &&
+                        same_public_ip(&eee->my_public_sock, &pi.sockets[0]))
+                    {
+                        n2n_sock_t lan_sock = pi.sockets[1];
+                        lan_sock.port = pi.sockets[0].port;
+                        try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
+                    }
+                    else if (pi.sockets[0].family != eee->supernode.family)
+                    {
+                        traceEvent(TRACE_DEBUG, "Peer %s addr family mismatch, relay only",
+                                   macaddr_str(mac_buf1, pi.mac));
+                    }
+                    else
+                    {
+                        try_send_register(eee, 1, pi.mac, &pi.sockets[0]);
+                    }
+                } else {
+                    int changed = 0;
+                    if (pi.sockets[0].family == AF_INET &&
+                        sock_equal(&pp->sock, &pi.sockets[0]) != 0) {
+                        pp->sock = pi.sockets[0];
+                        changed = 1;
+                    }
+                    if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6 &&
+                        sock_equal(&pp->sock6, &pi.sock6) != 0) {
+                        pp->sock6 = pi.sock6;
+                        changed = 1;
+                    }
+                    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                        pi.sockets[1].family != 0 && pi.sockets[1].port != 0 &&
+                        sock_equal(&pp->sock_lan, &pi.sockets[1]) != 0) {
+                        pp->sock_lan = pi.sockets[1];
+                        changed = 1;
+                    }
+                    if (changed) {
+                        pp->punch_start_time = 0;
+                        pp->punch_failed     = 0;
+                        start_punch(eee, pp);
+                    } else if (pp->punch_start_time == 0 && !pp->punch_failed) {
+                        start_punch(eee, pp);
+                    }
+                }
+            } else {
+                int addr_changed = 0;
+                if (pi.sockets[0].family == AF_INET &&
+                    sock_equal(&known->sock, &pi.sockets[0]) != 0)
+                    addr_changed = 1;
+                if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6 &&
+                    sock_equal(&known->sock6, &pi.sock6) != 0)
+                    addr_changed = 1;
 
-            /* Find or create a pending_peers entry, move known peer back if needed */
-            struct peer_info *pp = find_peer_by_mac(eee->pending_peers, pi.mac);
-            if (!pp) {
-                struct peer_info *kp = find_peer_by_mac(eee->known_peers, pi.mac);
-                if (kp) {
-                    /* Move known peer back to pending for re-punch */
-                    traceEvent(TRACE_INFO, "Peer %s re-detected, re-punching",
+                if (addr_changed) {
+                    traceEvent(TRACE_NORMAL, "Peer %s addr changed, re-punching",
                                macaddr_str(mac_buf1, pi.mac));
                     struct peer_info *prev2 = NULL, *s2 = eee->known_peers;
                     while (s2 && memcmp(s2->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
@@ -2843,28 +2785,44 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                     if (s2) {
                         if (prev2) prev2->next = s2->next;
                         else eee->known_peers = s2->next;
-                        s2->next = eee->pending_peers;
-                        eee->pending_peers = s2;
-                        pp = s2;
+                        free(s2);
+                    }
+                    if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
+                        pi.sock6.family == AF_INET6 &&
+                        eee->supernode.family == AF_INET6)
+                    {
+                        try_send_register(eee, 1, pi.mac, &pi.sock6);
+                    }
+                    else if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                        pi.sockets[1].family != 0 && pi.sockets[1].port != 0 &&
+                        eee->my_public_sock.family == AF_INET &&
+                        pi.sockets[0].family == AF_INET &&
+                        same_public_ip(&eee->my_public_sock, &pi.sockets[0]))
+                    {
+                        n2n_sock_t lan_sock = pi.sockets[1];
+                        lan_sock.port = pi.sockets[0].port;
+                        try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
+                    }
+                    else if (pi.sockets[0].family != eee->supernode.family)
+                    {
+                        traceEvent(TRACE_DEBUG, "Peer %s addr family mismatch on re-punch, relay only",
+                                   macaddr_str(mac_buf1, pi.mac));
+                    }
+                    else
+                    {
+                        try_send_register(eee, 1, pi.mac, &pi.sockets[0]);
                     }
                 } else {
-                    pp = (struct peer_info*) calloc(1, sizeof(struct peer_info));
-                    if (!pp) { PEERS_UNLOCK(eee); goto peer_info_done; }
-                    memcpy(pp->mac_addr, pi.mac, N2N_MAC_SIZE);
-                    peer_list_add(&eee->pending_peers, pp);
+                    if (pi.version[0] != '\0')
+                        strncpy(known->version, pi.version, sizeof(known->version) - 1);
+                    if (pi.os_name[0] != '\0')
+                        strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
+                    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                        pi.sockets[1].family != 0 && pi.sockets[1].port != 0)
+                        known->sock_lan = pi.sockets[1];
                 }
             }
-            if (pp) {
-                FILL_PEER_ADDRS(pp);
-                pp->last_seen        = now;
-                pp->punch_start_time = 0;
-                pp->punch_failed     = 0;
-                pp->punch_phase      = PUNCH_PHASE_LAN;
-                start_punch(eee, pp);
-            }
-#undef FILL_PEER_ADDRS
             PEERS_UNLOCK(eee);
-            peer_info_done:;
         }
         else if(msg_type == MSG_TYPE_REGISTER_SUPER_ACK)
         {

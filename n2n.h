@@ -217,14 +217,6 @@ typedef char ipstr_t[INET6_ADDRSTRLEN];
 #define N2N_MACSTR_SIZE 32
 typedef char macstr_t[N2N_MACSTR_SIZE];
 
-/* Hole-punch phases: tried in order, skipping unavailable ones */
-#define PUNCH_PHASE_LAN   0   /* LAN direct (same public IP) */
-#define PUNCH_PHASE_IPV6  1   /* IPv6 WAN punch */
-#define PUNCH_PHASE_IPV4  2   /* IPv4 WAN punch */
-#define PUNCH_PHASE_DONE  3   /* all phases exhausted -> relay */
-
-#define PUNCH_PHASE_TIMEOUT  10  /* seconds per phase before advancing */
-
 struct peer_info {
     struct peer_info *  next;
     n2n_community_t     community_name;
@@ -236,9 +228,8 @@ struct peer_info {
     char                version[8];
     char                os_name[16];
     uint32_t            assigned_ip;
-    time_t              punch_start_time;  /* when current phase started */
-    uint8_t             punch_phase;       /* current PUNCH_PHASE_* */
-    uint8_t             punch_failed;      /* 1 = all phases done, using relay */
+    time_t              punch_start_time;  /* when hole-punch started */
+    uint8_t             punch_failed;      /* 1 = punch failed, using relay */
     time_t              punch_reset_time;  /* when punch_failed was set, for retry */
     time_t              last_probe_sent;   /* time last keepalive PROBE was sent */
     uint8_t             keepalive_fails;   /* consecutive keepalive failures */
@@ -247,6 +238,8 @@ struct peer_info {
     uint8_t             punch_retry_count; /* number of full-cycle retries */
     uint8_t             first_seen;        /* 1 = first real packet logged (P2P or relay) */
     uint8_t             last_was_relay;    /* 1 = last packet was via relay (for state change detection) */
+    time_t              lan_punch_start;   /* when LAN punch started */
+    uint8_t             lan_punch_done;    /* 1 = LAN punch done (success or timeout) */
 };
 
 struct n2n_edge; /* defined in edge.c */
