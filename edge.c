@@ -220,7 +220,7 @@ static const char * supernode_ip( const n2n_edge_t * eee )
 }
 
 
-static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addr);
+static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addr, int quiet);
 
 static void send_packet2net(n2n_edge_t * eee,
                 uint8_t *decrypted_msg, size_t len);
@@ -1729,23 +1729,20 @@ static void update_peer_address(n2n_edge_t * eee,
                                 time_t when)
 {
     struct peer_info *scan = eee->known_peers;
-    struct peer_info *prev = NULL; /* use to remove bad registrations. */
+    struct peer_info *prev = NULL;
     n2n_sock_str_t sockbuf1;
-    n2n_sock_str_t sockbuf2; /* don't clobber sockbuf1 if writing two addresses to trace */
+    n2n_sock_str_t sockbuf2;
     macstr_t mac_buf;
 
     if ( is_empty_ip_address( peer ) )
     {
-        /* Not to be registered. */
         return;
     }
 
     if ( 0 == memcmp( mac, broadcast_mac, N2N_MAC_SIZE ) )
     {
-        /* Not to be registered. */
         return;
     }
-
 
     while(scan != NULL)
     {
@@ -1753,40 +1750,39 @@ static void update_peer_address(n2n_edge_t * eee,
         {
             break;
         }
-
         prev = scan;
         scan = scan->next;
     }
 
     if ( NULL == scan )
     {
-        /* Not in known_peers. */
         return;
     }
 
-    if ( 0 != sock_equal( &(scan->sock), peer))
+    /* Determine which socket field to compare/update based on address type */
+    n2n_sock_t *target_sock = NULL;
+    if (peer->family == AF_INET6)
+        target_sock = &scan->sock6;
+    else if (is_private_ipv4(peer))
+        target_sock = &scan->sock_lan;
+    else
+        target_sock = &scan->sock;
+
+    if ( 0 != sock_equal( target_sock, peer))
     {
         if ( 0 == from_supernode )
         {
             traceEvent( TRACE_INFO, "Peer addr updated %s: %s -> %s",
                         macaddr_str( mac_buf, scan->mac_addr ),
-                        sock_to_cstr(sockbuf1, &(scan->sock)),
+                        sock_to_cstr(sockbuf1, target_sock),
                         sock_to_cstr(sockbuf2, peer) );
-            if (peer->family == AF_INET)
-                scan->sock = *peer;
-            else if (peer->family == AF_INET6)
-                scan->sock6 = *peer;
+            *target_sock = *peer;
         }
-        /* else: ignore supernode's view, it may see a different socket */
     }
     else
     {
-        if (peer->family == AF_INET)
-            scan->sock = *peer;
-        else if (peer->family == AF_INET6)
-            scan->sock6 = *peer;
+        *target_sock = *peer;
     }
-    /* Always update last_seen for both direct and relayed packets */
     scan->last_seen = when;
 }
 
@@ -1825,11 +1821,13 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         memcpy(&old_sn, &(eee->supernode), sizeof(n2n_sock_t));
         memcpy(&old_sn_alt, &(eee->supernode_alt), sizeof(n2n_sock_t));
         
-        supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx]);
+        /* Quiet mode if we already have a valid address - don't spam warnings */
+        int quiet = (old_sn.family != 0);
+        supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx], quiet);
         memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
         {
             int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
-            if (supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx]) != 0)
+            if (supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx], 1) != 0)
                 memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
         }
         
@@ -2191,15 +2189,24 @@ static int handle_PACKET( n2n_edge_t * eee,
     if (NULL == scan) {
         try_send_register(eee, from_supernode, pkt->srcMac, orig_sender);
     } else if (!from_supernode) {
-        /* P2P packet from known peer: only update address if it changed */
-        if (0 != sock_equal(&scan->sock, orig_sender)) {
+        /* P2P packet from known peer: update address if changed */
+        n2n_sock_t *target_sock;
+        if (orig_sender->family == AF_INET6)
+            target_sock = &scan->sock6;
+        else if (is_private_ipv4(orig_sender))
+            target_sock = &scan->sock_lan;
+        else
+            target_sock = &scan->sock;
+        if (0 != sock_equal(target_sock, orig_sender)) {
             update_peer_address(eee, from_supernode, pkt->srcMac, orig_sender, now);
         } else {
             scan->last_seen = now;
         }
         scan->last_p2p = now;
     } else {
-        update_peer_address(eee, from_supernode, pkt->srcMac, orig_sender, now);
+        /* From supernode: just update last_seen, don't change address.
+         * The supernode may see a different socket than the actual peer. */
+        scan->last_seen = now;
     }
     PEERS_UNLOCK(eee);
 
@@ -2238,7 +2245,9 @@ static int handle_PACKET( n2n_edge_t * eee,
                     if ( !sp ) sp = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
                     if ( sp && sp->assigned_ip == 0 )
                         sp->assigned_ip = ntohl(src_ip);
-                    /* Log P2P/PsP status - only once per peer */
+                    /* Log P2P/PsP status - only once per peer
+                     * FIXME: Temporary workaround - using DEBUG level to reduce noise.
+                     * The relay/direct alternating issue needs further investigation. */
                     if ( sp && !sp->first_seen ) {
                         sp->first_seen = 1;
                         sp->last_was_relay = from_supernode;
@@ -2250,9 +2259,9 @@ static int handle_PACKET( n2n_edge_t * eee,
                         }
                         n2n_sock_str_t sockbuf;
                         if (from_supernode)
-                            traceEvent(TRACE_NORMAL, "PsP relay with %s via supernode", vip);
+                            traceEvent(TRACE_DEBUG, "PsP relay with %s via supernode", vip);
                         else
-                            traceEvent(TRACE_NORMAL, "P2P direct with %s at %s",
+                            traceEvent(TRACE_DEBUG, "P2P direct with %s at %s",
                                        vip, sock_to_cstr(sockbuf, orig_sender));
                     }
                     PEERS_UNLOCK(eee);
@@ -2915,57 +2924,17 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                     }
                 }
             } else {
-                int addr_changed = 0;
-                if (is_valid_peer_sock(&pi.sockets[0]) &&
-                    sock_equal(&known->sock, &pi.sockets[0]) != 0)
-                    addr_changed = 1;
-                if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6 &&
-                    sock_equal(&known->sock6, &pi.sock6) != 0)
-                    addr_changed = 1;
-
-                if (addr_changed) {
-                    traceEvent(TRACE_NORMAL, "Peer %s addr changed, re-punching",
-                               macaddr_str(mac_buf1, pi.mac));
-                    struct peer_info *prev2 = NULL, *s2 = eee->known_peers;
-                    while (s2 && memcmp(s2->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
-                        prev2 = s2; s2 = s2->next;
-                    }
-                    if (s2) {
-                        if (prev2) prev2->next = s2->next;
-                        else eee->known_peers = s2->next;
-                        free(s2);
-                    }
-                    int started = 0;
-                    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
-                        is_valid_lan_sock(&pi.sockets[1]) &&
-                        eee->my_public_sock.family == AF_INET &&
-                        pi.sockets[0].family == AF_INET &&
-                        same_public_ip(&eee->my_public_sock, &pi.sockets[0]))
-                    {
-                        n2n_sock_t lan_sock = pi.sockets[1];
-                        lan_sock.port = pi.sockets[0].port;
-                        try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
-                        started = 1;
-                    }
-                    if (!started && (pi.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
-                        pi.sock6.family == AF_INET6 && eee->udp_sock6 != -1)
-                    {
-                        try_send_register(eee, 1, pi.mac, &pi.sock6);
-                        started = 1;
-                    }
-                    if (!started && is_valid_peer_sock(&pi.sockets[0]) && eee->udp_sock != -1)
-                    {
-                        try_send_register(eee, 1, pi.mac, &pi.sockets[0]);
-                    }
-                } else {
-                    if (pi.version[0] != '\0')
-                        strncpy(known->version, pi.version, sizeof(known->version) - 1);
-                    if (pi.os_name[0] != '\0')
-                        strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
-                    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
-                        is_valid_lan_sock(&pi.sockets[1]))
-                        known->sock_lan = pi.sockets[1];
-                }
+                /* Peer already in known_peers - ignore address changes from PEER_INFO.
+                 * The direct connection address should only be updated from actual
+                 * P2P packets (handle_PACKET), not from supernode reports.
+                 * This follows cnn2n's approach to avoid false address changes. */
+                if (pi.version[0] != '\0')
+                    strncpy(known->version, pi.version, sizeof(known->version) - 1);
+                if (pi.os_name[0] != '\0')
+                    strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
+                if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                    is_valid_lan_sock(&pi.sockets[1]))
+                    known->sock_lan = pi.sockets[1];
             }
             PEERS_UNLOCK(eee);
         }
@@ -3359,7 +3328,7 @@ static int query_txt_record(const char *domain, char *txt_result, size_t result_
  *  REVISIT: This is a really bad idea. The edge will block completely while the
  *           hostname resolution is performed. This could take 15 seconds.
  */
-static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
+static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn, int quiet) {
     n2n_sn_name_t addr;
     size_t len;
     int err;
@@ -3422,7 +3391,8 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
                 }
                 err = 0;
             } else {
-                traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s", addr);
+                if (!quiet)
+                    traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s", addr);
                 err = -1;
             }
         } else {
@@ -4009,7 +3979,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         traceEvent( TRACE_NORMAL, "supernode %u => %s\n", i, (eee.sn_ip_array[i]) );
     }
 
-    while (supernode2addr( &(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx] ) != 0) {
+    while (supernode2addr( &(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx], 0 ) != 0) {
         if (!g_edge_running) break;
         traceEvent(TRACE_WARNING, "Failed to resolve supernode, retrying in 5 seconds...");
 #ifdef _WIN32
@@ -4023,7 +3993,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     memset(&eee.supernode_alt, 0, sizeof(n2n_sock_t));
     {
         int alt_af = (eee.supernode.family == AF_INET6) ? AF_INET : AF_INET6;
-        if (supernode2addr(&eee.supernode_alt, alt_af, eee.sn_ip_array[eee.sn_idx]) == 0) {
+        if (supernode2addr(&eee.supernode_alt, alt_af, eee.sn_ip_array[eee.sn_idx], 1) == 0) {
             n2n_sock_str_t sockbuf_alt;
             traceEvent(TRACE_INFO, "Supernode alt address resolved: %s",
                        sock_to_cstr(sockbuf_alt, &eee.supernode_alt));
