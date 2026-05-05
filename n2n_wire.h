@@ -215,6 +215,7 @@ struct n2n_PROBE
 {
     n2n_mac_t           srcMac;     /* sender MAC */
     n2n_mac_t           dstMac;     /* target MAC */
+    n2n_sock_t          suggest_lan_addr; /* suggested LAN addr for peer to connect (family=0 if not set) */
 };
 typedef struct n2n_PROBE n2n_PROBE_t;
 

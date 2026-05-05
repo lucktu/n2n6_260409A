@@ -1036,7 +1036,7 @@ static int same_subnet(const n2n_sock_t *sock1, const n2n_sock_t *sock2) {
 }
 
 /** Send a PROBE packet directly to a peer to open NAT mapping */
-static void send_probe( n2n_edge_t * eee, const n2n_sock_t * peer_sock, const n2n_mac_t dstMac )
+static void send_probe( n2n_edge_t * eee, const n2n_sock_t * peer_sock, const n2n_mac_t dstMac, const struct peer_info * peer )
 {
     uint8_t pktbuf[N2N_PKT_BUF_SIZE];
     size_t idx = 0;
@@ -1053,9 +1053,38 @@ static void send_probe( n2n_edge_t * eee, const n2n_sock_t * peer_sock, const n2
     memcpy(probe.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
     memcpy(probe.dstMac, dstMac, N2N_MAC_SIZE);
 
+    memset(&probe.suggest_lan_addr, 0, sizeof(n2n_sock_t));
+
+    if ( peer && peer->sock_lan.family == AF_INET && eee->local_sock_ena ) {
+        if ( same_subnet(&eee->local_sock, &peer->sock_lan) ) {
+            probe.suggest_lan_addr = eee->local_sock;
+        }
+        for (int i = 0; i < eee->local_socks_count && probe.suggest_lan_addr.family == 0; i++) {
+            if ( same_subnet(&eee->local_socks[i], &peer->sock_lan) ) {
+                probe.suggest_lan_addr = eee->local_socks[i];
+            }
+        }
+    }
+    if ( peer && peer->sock.family == AF_INET && probe.suggest_lan_addr.family == 0 && eee->local_sock_ena ) {
+        if ( same_subnet(&eee->local_sock, &peer->sock) ) {
+            probe.suggest_lan_addr = eee->local_sock;
+        }
+        for (int i = 0; i < eee->local_socks_count && probe.suggest_lan_addr.family == 0; i++) {
+            if ( same_subnet(&eee->local_socks[i], &peer->sock) ) {
+                probe.suggest_lan_addr = eee->local_socks[i];
+            }
+        }
+    }
+
     encode_PROBE(pktbuf, &idx, &cmn, &probe);
 
-    traceEvent(TRACE_DEBUG, "send PROBE to %s", sock_to_cstr(sockbuf, peer_sock));
+    if ( probe.suggest_lan_addr.family != 0 ) {
+        n2n_sock_str_t sockbuf2;
+        traceEvent(TRACE_DEBUG, "send PROBE to %s, suggest_lan_addr=%s", 
+                   sock_to_cstr(sockbuf, peer_sock), sock_to_cstr(sockbuf2, &probe.suggest_lan_addr));
+    } else {
+        traceEvent(TRACE_DEBUG, "send PROBE to %s", sock_to_cstr(sockbuf, peer_sock));
+    }
     sendto_sock(sock_for_dest(eee, peer_sock), pktbuf, idx, peer_sock);
 }
 
@@ -1208,7 +1237,7 @@ static void advance_punch_phase( n2n_edge_t * eee, struct peer_info * peer, time
     n2n_sock_str_t sb;
     traceEvent(TRACE_INFO, "punch phase %u for %s -> %s",
                phase, PEER_ID(mac_tmp, peer), sock_to_cstr(sb, sock));
-    send_probe(eee, sock, peer->mac_addr);
+    send_probe(eee, sock, peer->mac_addr, peer);
     send_register(eee, &eee->supernode);
 }
 
@@ -1251,7 +1280,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     n2n_sock_str_t sb;
     traceEvent(TRACE_INFO, "hole-punch started for %s phase %u -> %s",
                PEER_ID(mac_tmp, peer), phase, sock_to_cstr(sb, sock));
-    send_probe(eee, sock, peer->mac_addr);
+    send_probe(eee, sock, peer->mac_addr, peer);
     send_register(eee, &eee->supernode);
 }
 
@@ -1269,7 +1298,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             {
                 const n2n_sock_t *sock = punch_phase_sock(eee, scan, scan->punch_phase);
                 if ( sock ) {
-                    send_probe(eee, sock, scan->mac_addr);
+                    send_probe(eee, sock, scan->mac_addr, scan);
                     scan->last_punch_probe = now;
                 }
             }
@@ -2742,12 +2771,20 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
         {
             /* Another edge sent us a direct PROBE to open NAT mapping.
              * 1. Send PROBE_ACK via supernode so sender learns their public addr.
-             * 2. Start reverse punch only if not already in progress/done. */
+             * 2. Start reverse punch only if not already in progress/done.
+             * 3. If PROBE contains suggest_lan_addr, use it for direct LAN connect. */
             n2n_PROBE_t probe;
             decode_PROBE(&probe, &cmn, udp_buf, &rem, &idx);
 
-            traceEvent(TRACE_INFO, "Rx PROBE from %s at %s - sending PROBE_ACK",
-                       macaddr_str(mac_buf1, probe.srcMac), sock_to_cstr(sockbuf1, &sender));
+            if ( probe.suggest_lan_addr.family != 0 ) {
+                n2n_sock_str_t sockbuf2;
+                traceEvent(TRACE_INFO, "Rx PROBE from %s at %s, suggest_lan_addr=%s",
+                           macaddr_str(mac_buf1, probe.srcMac), sock_to_cstr(sockbuf1, &sender),
+                           sock_to_cstr(sockbuf2, &probe.suggest_lan_addr));
+            } else {
+                traceEvent(TRACE_INFO, "Rx PROBE from %s at %s - sending PROBE_ACK",
+                           macaddr_str(mac_buf1, probe.srcMac), sock_to_cstr(sockbuf1, &sender));
+            }
 
             /* Send PROBE_ACK via supernode: tell sender what addr we observed */
             send_probe_ack(eee, probe.srcMac, &sender);
@@ -2760,6 +2797,9 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                     kp->last_seen       = now;
                     kp->last_probe_sent = 0;
                     kp->keepalive_fails = 0;
+                    if ( probe.suggest_lan_addr.family != 0 ) {
+                        kp->sock_lan = probe.suggest_lan_addr;
+                    }
                 } else {
                     struct peer_info *pscan = find_peer_by_mac(eee->pending_peers, probe.srcMac);
                     if ( NULL == pscan ) {
@@ -2769,7 +2809,15 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                             pscan->sock6 = sender;
                         else
                             pscan->sock = sender;
-                        send_register(eee, &sender);
+                        if ( probe.suggest_lan_addr.family != 0 ) {
+                            pscan->sock_lan = probe.suggest_lan_addr;
+                            traceEvent(TRACE_INFO, "Using suggested LAN addr %s for peer %s",
+                                       sock_to_cstr(sockbuf1, &probe.suggest_lan_addr),
+                                       macaddr_str(mac_buf1, probe.srcMac));
+                            send_register(eee, &probe.suggest_lan_addr);
+                        } else {
+                            send_register(eee, &sender);
+                        }
                     }
                 }
             }

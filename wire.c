@@ -550,6 +550,10 @@ size_t encode_PROBE( uint8_t * base,
     retval += encode_common( base, idx, common );
     retval += encode_mac( base, idx, probe->srcMac );
     retval += encode_mac( base, idx, probe->dstMac );
+    if ( probe->suggest_lan_addr.family != 0 )
+    {
+        retval += encode_sock( base, idx, &(probe->suggest_lan_addr) );
+    }
     return retval;
 }
 
@@ -563,6 +567,10 @@ size_t decode_PROBE( n2n_PROBE_t * probe,
     memset( probe, 0, sizeof(n2n_PROBE_t) );
     retval += decode_mac( probe->srcMac, base, rem, idx );
     retval += decode_mac( probe->dstMac, base, rem, idx );
+    if ( *rem >= 8 )
+    {
+        retval += decode_sock( &(probe->suggest_lan_addr), base, rem, idx );
+    }
     return retval;
 }
 
